@@ -1,13 +1,17 @@
-"""Right-hand monitor: browser status, logs, post preview."""
+"""Right-hand monitor: browser, logs, posts, recognition + correction."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QTabWidget,
     QTreeWidget,
     QTreeWidgetItem,
@@ -16,17 +20,19 @@ from PySide6.QtWidgets import (
 )
 
 from services.log_buffer import LogBuffer
-from storage.repository import PostPreview
+from storage.repository import DeckPreview, PostPreview, RecognitionPreview
 
 
 class MonitorPanel(QWidget):
     open_browser_requested = Signal()
     close_browser_requested = Signal()
     open_output_requested = Signal()
+    correction_requested = Signal(object)  # dict payload
 
     def __init__(self, log_buffer: LogBuffer | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.log_buffer = log_buffer or LogBuffer(max_entries=500)
+        self._selected_deck_card_id: int | None = None
         self._build()
 
     def _build(self) -> None:
@@ -61,8 +67,7 @@ class MonitorPanel(QWidget):
         self.browser_status_view.setReadOnly(True)
         self.browser_status_view.setPlainText(
             "Playwright Chromium（可見視窗，與主程式分離）。\n"
-            "首次請在瀏覽器中自行登入；本程式不會記錄認證資料。\n"
-            "貼文資料請使用合規 JSON/CSV／本機圖片匯入（Phase 2）。"
+            "Phase 3 使用啟發式／可替換辨識管線；不宣稱 YOLO 已達標。"
         )
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -71,33 +76,55 @@ class MonitorPanel(QWidget):
         self.posts_tree.setHeaderLabels(
             ["來源 ID", "帳號", "文字預覽", "圖片數", "時間", "網址"]
         )
-        self.posts_tree.setColumnWidth(0, 100)
-        self.posts_tree.setColumnWidth(1, 100)
         self.posts_tree.setColumnWidth(2, 320)
-        self.posts_tree.setRootIsDecorated(True)
-
-        # Keep plain-text alias for older tests / fallback
         self.posts_view = QPlainTextEdit()
         self.posts_view.setReadOnly(True)
-        self.posts_view.setPlaceholderText("貼文結果文字預覽")
-
         posts_tab = QWidget()
         posts_layout = QVBoxLayout(posts_tab)
         posts_layout.setContentsMargins(0, 0, 0, 0)
         posts_layout.addWidget(self.posts_tree, stretch=3)
         posts_layout.addWidget(self.posts_view, stretch=1)
 
+        # Recognition + correction tab
+        vision_tab = QWidget()
+        vision_layout = QVBoxLayout(vision_tab)
+        self.decks_tree = QTreeWidget()
+        self.decks_tree.setHeaderLabels(
+            ["牌組 / 卡號", "數量", "名稱", "確認", "deck_card_id"]
+        )
+        self.decks_tree.setColumnHidden(4, True)
+        self.decks_tree.itemSelectionChanged.connect(self._on_deck_selection)
+        vision_layout.addWidget(self.decks_tree, stretch=3)
+
+        correct = QFormLayout()
+        self.edit_card_number = QLineEdit()
+        self.edit_card_number.setPlaceholderText("例如 ABC/S123-001")
+        self.spin_qty = QSpinBox()
+        self.spin_qty.setRange(1, 99)
+        self.chk_confirmed = QCheckBox("已確認")
+        self.edit_note = QLineEdit()
+        self.edit_note.setPlaceholderText("修正備註（寫入 correction_log）")
+        self.btn_apply_correction = QPushButton("套用校正")
+        self.btn_apply_correction.clicked.connect(self._emit_correction)
+        correct.addRow("卡號", self.edit_card_number)
+        correct.addRow("數量", self.spin_qty)
+        correct.addRow(self.chk_confirmed)
+        correct.addRow("備註", self.edit_note)
+        correct.addRow(self.btn_apply_correction)
+        vision_layout.addLayout(correct)
+
         self.vision_view = QPlainTextEdit()
         self.vision_view.setReadOnly(True)
-        self.vision_view.setPlaceholderText("圖片辨識結果（Phase 3）")
+        self.vision_view.setPlaceholderText("辨識明細")
+        vision_layout.addWidget(self.vision_view, stretch=1)
+
         self.errors_view = QPlainTextEdit()
         self.errors_view.setReadOnly(True)
-        self.errors_view.setPlaceholderText("錯誤紀錄")
 
         self.tabs.addTab(self.browser_status_view, "瀏覽器狀態")
         self.tabs.addTab(self.log_view, "執行日誌")
         self.tabs.addTab(posts_tab, "貼文結果")
-        self.tabs.addTab(self.vision_view, "圖片辨識結果")
+        self.tabs.addTab(vision_tab, "圖片辨識結果")
         self.tabs.addTab(self.errors_view, "錯誤紀錄")
         root.addWidget(self.tabs, stretch=1)
 
@@ -142,12 +169,78 @@ class MonitorPanel(QWidget):
                 ]
             )
             for path in preview.image_paths:
-                child = QTreeWidgetItem(["", "", path, "", "", ""])
-                item.addChild(child)
+                item.addChild(QTreeWidgetItem(["", "", path, "", "", ""]))
             self.posts_tree.addTopLevelItem(item)
             lines.append(
                 f"[{preview.source_id}] @{preview.author_handle} "
                 f"({preview.image_count} img)\n{preview.text}\n"
             )
         self.posts_view.setPlainText("\n".join(lines) if lines else "（尚無貼文）")
-        self.tabs.setCurrentIndex(2)
+
+    def show_decks(self, decks: list[DeckPreview]) -> None:
+        self.decks_tree.clear()
+        for deck in decks:
+            parent = QTreeWidgetItem(
+                [
+                    f"#{deck.id} {deck.name}",
+                    "",
+                    deck.source_key,
+                    deck.status,
+                    "",
+                ]
+            )
+            for card in deck.cards:
+                child = QTreeWidgetItem(
+                    [
+                        card.card_number or "(未知)",
+                        str(card.quantity),
+                        card.card_name or "",
+                        "Y" if card.confirmed else "N",
+                        str(card.id),
+                    ]
+                )
+                parent.addChild(child)
+            parent.setExpanded(True)
+            self.decks_tree.addTopLevelItem(parent)
+        self.tabs.setCurrentIndex(3)
+
+    def show_recognitions(self, items: list[RecognitionPreview]) -> None:
+        lines = []
+        for r in items[:200]:
+            lines.append(
+                f"#{r.id} img={r.post_image_id} deck={r.deck_id} "
+                f"[{r.status}] {r.card_number or '-'} conf={r.confidence or '-'} "
+                f"confirmed={r.confirmed}\n  {r.crop_path or ''}"
+            )
+        self.vision_view.setPlainText("\n".join(lines) if lines else "（尚無辨識結果）")
+
+    def _on_deck_selection(self) -> None:
+        items = self.decks_tree.selectedItems()
+        if not items:
+            self._selected_deck_card_id = None
+            return
+        item = items[0]
+        raw_id = item.text(4)
+        if not raw_id:
+            self._selected_deck_card_id = None
+            return
+        self._selected_deck_card_id = int(raw_id)
+        self.edit_card_number.setText(item.text(0) if item.text(0) != "(未知)" else "")
+        try:
+            self.spin_qty.setValue(int(item.text(1) or "1"))
+        except ValueError:
+            self.spin_qty.setValue(1)
+        self.chk_confirmed.setChecked(item.text(3) == "Y")
+
+    def _emit_correction(self) -> None:
+        if self._selected_deck_card_id is None:
+            return
+        self.correction_requested.emit(
+            {
+                "deck_card_id": self._selected_deck_card_id,
+                "card_number": self.edit_card_number.text().strip() or None,
+                "quantity": self.spin_qty.value(),
+                "confirmed": self.chk_confirmed.isChecked(),
+                "note": self.edit_note.text().strip(),
+            }
+        )
