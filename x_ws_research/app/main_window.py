@@ -1,4 +1,4 @@
-"""Main application window — Phase 1 shell."""
+"""Main application window — Phase 2 import + preview."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSplitter,
     QToolBar,
-    QWidget,
 )
 
 from app.threads.browser_thread import BrowserThread
@@ -22,17 +21,24 @@ from app.widgets.left_panel import LeftSettingsPanel
 from app.widgets.monitor_panel import MonitorPanel
 from app.widgets.status_bar import AppStatusBar
 from schemas.task_state import TaskState
+from services.import_service import ImportRequest
 from services.log_buffer import LogBuffer
-from services.paths import ensure_data_dirs, get_browser_profile_dir
+from services.paths import ensure_data_dirs, get_browser_profile_dir, get_data_root
+from storage.database import Database
+from storage.repository import PostPreview
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("X 貼文蒐集 × Weiss Schwarz 牌組工具 — Phase 1")
+        self.setWindowTitle("X 貼文蒐集 × Weiss Schwarz 牌組工具 — Phase 2")
         self.resize(1200, 760)
 
         self._dirs = ensure_data_dirs()
+        self._db_path = get_data_root() / "db" / "app.sqlite"
+        self._images_root = self._dirs["images"]
+        Database(self._db_path).create_schema()
+
         self._log_buffer = LogBuffer(max_entries=500)
         self._task_state = TaskState.IDLE
         self._browser_status = "CLOSED"
@@ -43,15 +49,19 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status)
 
         self._browser_thread = BrowserThread(profile_dir=get_browser_profile_dir())
-        self._task_thread = TaskThread()
+        self._task_thread = TaskThread(
+            db_path=self._db_path,
+            images_root=self._images_root,
+        )
         self._wire_threads()
         self._browser_thread.start()
         self._task_thread.start()
 
         self._apply_task_state(TaskState.IDLE)
-        self.monitor.append_log("Application started (Phase 1 skeleton).", "INFO")
+        self.monitor.append_log("Application started (Phase 2 import).", "INFO")
         self.monitor.append_log(f"Data root: {self._dirs['root']}", "INFO")
-        self.monitor.append_log(f"Browser profile: {get_browser_profile_dir()}", "INFO")
+        self.monitor.append_log(f"Database: {self._db_path}", "INFO")
+        self._request_refresh()
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("主工具列")
@@ -107,7 +117,6 @@ class MainWindow(QMainWindow):
         bw = self._browser_thread.worker
         tw = self._task_thread.worker
 
-        # Optional headless for CI / no-display smoke (visible by default)
         if os.environ.get("X_WS_BROWSER_HEADLESS", "").lower() in {"1", "true", "yes"}:
             bw.set_headless(True)
 
@@ -120,15 +129,28 @@ class MainWindow(QMainWindow):
         tw.state_changed.connect(self._on_task_state_str)
         tw.log_message.connect(self.monitor.append_log)
         tw.progress.connect(self._on_task_progress)
+        tw.counts_changed.connect(self._on_counts)
+        tw.preview_ready.connect(self._on_preview_ready)
         tw.finished_ok.connect(lambda: self._status.set_hint("任務完成"))
         tw.failed.connect(self._on_task_failed)
 
-        # Queued slot invocations onto worker threads
-        self._sig_open_browser = bw.open_browser
-        self._sig_close_browser = bw.close_browser
-        self._sig_cleanup_browser = bw.cleanup
-        self._sig_run_task = tw.run_demo_task
-        self._sig_stop_task = tw.request_stop
+    def _invoke_worker(self, method_name: str) -> None:
+        from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
+
+        QMetaObject.invokeMethod(
+            self._task_thread.worker,
+            method_name,
+            QtCoreQt.ConnectionType.QueuedConnection,
+        )
+
+    def _invoke_browser(self, method_name: str) -> None:
+        from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
+
+        QMetaObject.invokeMethod(
+            self._browser_thread.worker,
+            method_name,
+            QtCoreQt.ConnectionType.QueuedConnection,
+        )
 
     # --- Browser ---
 
@@ -137,25 +159,12 @@ class MainWindow(QMainWindow):
         self._status.set_hint("正在啟動瀏覽器…")
         self.act_open_browser.setEnabled(False)
         self.monitor.btn_open_browser.setEnabled(False)
-        # Invoke on browser thread
-        from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
-
-        QMetaObject.invokeMethod(
-            self._browser_thread.worker,
-            "open_browser",
-            QtCoreQt.ConnectionType.QueuedConnection,
-        )
+        self._invoke_browser("open_browser")
 
     @Slot()
     def _on_close_browser(self) -> None:
         self._status.set_hint("正在關閉瀏覽器…")
-        from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
-
-        QMetaObject.invokeMethod(
-            self._browser_thread.worker,
-            "close_browser",
-            QtCoreQt.ConnectionType.QueuedConnection,
-        )
+        self._invoke_browser("close_browser")
 
     @Slot()
     def _on_browser_started(self) -> None:
@@ -182,40 +191,31 @@ class MainWindow(QMainWindow):
         self._browser_status = status
         self.monitor.set_browser_status(status)
         self._status.set_browser_status(status)
-        ready = status == "READY"
         self.act_open_browser.setEnabled(status in {"CLOSED", "ERROR"})
-        self.act_close_browser.setEnabled(ready or status == "ERROR")
+        self.act_close_browser.setEnabled(status in {"READY", "ERROR"})
 
-    # --- Task ---
+    # --- Task / import ---
 
     @Slot()
     def _on_start_task(self) -> None:
+        """Phase 2: Start opens the import dialog (primary data path)."""
         if not self._task_state.can_start:
             return
-        from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
-
-        QMetaObject.invokeMethod(
-            self._task_thread.worker,
-            "run_demo_task",
-            QtCoreQt.ConnectionType.QueuedConnection,
-        )
+        # Avoid nested modal when already choosing a file via 匯入…
+        self._on_import()
 
     @Slot()
     def _on_stop_task(self) -> None:
         if not self._task_state.can_stop:
             return
-        from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
-
-        QMetaObject.invokeMethod(
-            self._task_thread.worker,
-            "request_stop",
-            QtCoreQt.ConnectionType.QueuedConnection,
-        )
+        self._invoke_worker("request_stop")
 
     @Slot()
     def _on_refresh(self) -> None:
-        self.monitor.append_log("Refresh requested (stub).", "INFO")
-        self._status.set_hint("已重新整理（骨架）")
+        self._request_refresh()
+
+    def _request_refresh(self) -> None:
+        self._invoke_worker("refresh_preview")
 
     @Slot(str)
     def _on_task_state_str(self, state_name: str) -> None:
@@ -228,45 +228,50 @@ class MainWindow(QMainWindow):
         self._status.set_task_state(state.value)
         self.act_start.setEnabled(state.can_start)
         self.act_stop.setEnabled(state.can_stop)
+        self.act_import.setEnabled(state.can_start)
 
     @Slot(int, int)
     def _on_task_progress(self, current: int, total: int) -> None:
-        self.monitor.set_counts(posts=current)
         self._status.set_hint(f"進度 {current}/{total}")
+
+    @Slot(int, int, int, int)
+    def _on_counts(self, posts: int, images: int, vision: int, errors: int) -> None:
+        self.monitor.set_counts(posts=posts, images=images, vision=vision, errors=errors)
+
+    @Slot(object)
+    def _on_preview_ready(self, previews: object) -> None:
+        if isinstance(previews, list):
+            typed = [p for p in previews if isinstance(p, PostPreview)]
+            self.monitor.show_post_previews(typed)
 
     @Slot(str)
     def _on_task_failed(self, message: str) -> None:
         QMessageBox.warning(self, "任務失敗", message)
 
-    # --- Misc ---
-
     @Slot()
     def _on_import(self) -> None:
+        if not self._task_state.can_start:
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "匯入貼文（JSON / CSV stub）",
+            "匯入貼文（JSON / CSV）",
             str(Path.cwd()),
             "Import (*.json *.csv)",
         )
         if not path:
             return
-        self.monitor.append_log(f"Import selected: {path} (architecture stub)", "INFO")
-        try:
-            from crawler.post_source import create_import_source
 
-            source = create_import_source(path)
-            self.monitor.append_log(
-                f"PostSource ready: {type(source).__name__} — full import in Phase 2",
-                "INFO",
-            )
-            self.monitor.posts_view.setPlainText(
-                f"已選擇匯入來源：{path}\n"
-                f"介面：{type(source).__name__}\n"
-                "Phase 1 僅建立架構；實際批次寫入 DB 於 Phase 2。"
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.monitor.append_log(f"Import stub error: {exc}", "ERROR")
-            QMessageBox.warning(self, "匯入失敗", str(exc))
+        request = ImportRequest(
+            path=Path(path),
+            keywords=self.left.keyword_config(),
+            max_posts=self.left.max_posts.value(),
+            db_path=self._db_path,
+            images_root=self._images_root,
+        )
+        self._task_thread.worker.set_import_request(request)
+        self.monitor.append_log(f"Queued import: {path}", "INFO")
+        self._status.set_hint("匯入中…")
+        self._invoke_worker("run_import_task")
 
     @Slot()
     def _on_open_output(self) -> None:
@@ -281,12 +286,11 @@ class MainWindow(QMainWindow):
             self,
             "關於",
             "X 貼文蒐集與 Weiss Schwarz 牌組辨識工具\n"
-            "Phase 1：UI 骨架、可見 Chromium、任務狀態與日誌。\n"
+            "Phase 2：JSON/CSV 匯入、關鍵字篩選、SQLite、去重、預覽。\n"
             "不含 X 網頁自動化擷取。",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        """Ensure Chromium is torn down on exit."""
         self.monitor.append_log("Shutting down…", "INFO")
         from PySide6.QtCore import QEventLoop, QMetaObject, QTimer, Qt as QtCoreQt
 
@@ -299,7 +303,7 @@ class MainWindow(QMainWindow):
             QtCoreQt.ConnectionType.QueuedConnection,
         )
         QTimer.singleShot(8000, loop.quit)
-        if self._browser_status == "READY" or self._browser_status == "STARTING":
+        if self._browser_status in {"READY", "STARTING"}:
             loop.exec()
 
         self._browser_thread.quit()

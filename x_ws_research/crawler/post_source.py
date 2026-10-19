@@ -1,6 +1,6 @@
-"""Replaceable PostSource interface + JSON/CSV import stubs (Phase 1).
+"""Replaceable PostSource interface + working JSON/CSV importers.
 
-No live X scraping. Import adapters establish the architecture for Phase 2.
+No live X scraping. Local files only.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Iterable
 
 from schemas.models import PostRecord
+from services.keyword_filter import filter_posts as _filter_posts
 
 
 class PostSource(ABC):
@@ -24,7 +25,7 @@ class PostSource(ABC):
 
     @abstractmethod
     def fetch_posts(self) -> AsyncIterator[PostRecord]:
-        """Yield normalized posts. Implementations must not hit live X in Phase 1."""
+        """Yield normalized posts. Must not hit live X."""
         raise NotImplementedError
 
     @abstractmethod
@@ -33,8 +34,6 @@ class PostSource(ABC):
 
 
 class _FileImportSource(PostSource):
-    """Shared helpers for file-based import stubs."""
-
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self._opened = False
@@ -55,11 +54,13 @@ class _FileImportSource(PostSource):
 
 
 class JsonImportSource(_FileImportSource):
-    """Stub JSON importer.
+    """JSON importer.
 
-    Expected shapes (Phase 2 will harden parsing):
+    Accepted shapes:
     - ``{"posts": [ {...}, ... ]}``
-    - or a top-level list of post objects
+    - top-level list of post objects
+
+    Optional per-post keys: ``image_paths`` (local files), ``image_urls``.
     """
 
     async def fetch_posts(self) -> AsyncIterator[PostRecord]:
@@ -67,15 +68,16 @@ class JsonImportSource(_FileImportSource):
         raw = json.loads(self.path.read_text(encoding="utf-8"))
         items = raw["posts"] if isinstance(raw, dict) and "posts" in raw else raw
         if not isinstance(items, list):
-            raise ValueError("JSON import expects a list or {\"posts\": [...]}")
+            raise ValueError('JSON import expects a list or {"posts": [...]}')
         for item in items:
-            yield _coerce_post(item)
+            yield coerce_post(item, base_dir=self.path.parent)
 
 
 class CsvImportSource(_FileImportSource):
-    """Stub CSV importer.
+    """CSV importer.
 
-    Expected columns (flexible): source_id, author_handle, text, created_at, url, image_urls
+    Columns: source_id, author_handle, text, created_at, url, image_urls, image_paths
+    Multi-value fields use ``|`` as separator.
     """
 
     async def fetch_posts(self) -> AsyncIterator[PostRecord]:
@@ -83,11 +85,10 @@ class CsvImportSource(_FileImportSource):
         with self.path.open(newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
-                yield _coerce_post(row)
+                yield coerce_post(row, base_dir=self.path.parent)
 
 
 def create_import_source(path: Path | str) -> PostSource:
-    """Factory: choose JSON or CSV stub from file suffix."""
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".json":
@@ -97,9 +98,10 @@ def create_import_source(path: Path | str) -> PostSource:
     raise ValueError(f"Unsupported import format: {suffix} (use .json or .csv)")
 
 
-def _coerce_post(item: dict[str, Any] | Any) -> PostRecord:
+def coerce_post(item: dict[str, Any] | Any, *, base_dir: Path | None = None) -> PostRecord:
     if not isinstance(item, dict):
         raise TypeError(f"Post item must be a mapping, got {type(item)!r}")
+
     created = item.get("created_at")
     if isinstance(created, str) and created:
         try:
@@ -111,30 +113,67 @@ def _coerce_post(item: dict[str, Any] | Any) -> PostRecord:
     else:
         created_at = None
 
-    image_urls = item.get("image_urls") or item.get("images") or []
-    if isinstance(image_urls, str):
-        image_urls = [u.strip() for u in image_urls.split("|") if u.strip()]
+    image_urls = _as_str_list(item.get("image_urls") or item.get("images") or [])
+    image_paths_raw = _as_str_list(item.get("image_paths") or item.get("local_images") or [])
+    image_paths = [_resolve_optional(p, base_dir) for p in image_paths_raw]
 
-    source_id = str(item.get("source_id") or item.get("id") or "")
-    author = str(item.get("author_handle") or item.get("author") or item.get("handle") or "")
+    source_id = str(item.get("source_id") or item.get("id") or "").strip()
+    author = str(
+        item.get("author_handle") or item.get("author") or item.get("handle") or ""
+    ).strip()
     if not source_id:
         raise ValueError("post requires source_id (or id)")
     if not author:
         raise ValueError("post requires author_handle (or author/handle)")
 
+    # Preserve original text exactly as provided
+    text = item.get("text")
+    if text is None:
+        text = item.get("content")
+    text = "" if text is None else str(text)
+
     return PostRecord(
         source_id=source_id,
         author_handle=author.lstrip("@"),
-        text=str(item.get("text") or item.get("content") or ""),
+        text=text,
         created_at=created_at,
         url=item.get("url"),
-        image_urls=list(image_urls),
-        raw=dict(item),
+        image_urls=image_urls,
+        image_paths=image_paths,
+        raw={k: v for k, v in item.items() if k != "raw"},
     )
 
 
+def _as_str_list(value: Any) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [u.strip() for u in value.split("|") if u.strip()]
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    return [str(value)]
+
+
+def _resolve_optional(raw: str, base_dir: Path | None) -> Path:
+    path = Path(raw)
+    if path.is_file():
+        return path.resolve()
+    if base_dir is not None:
+        candidate = (base_dir / path).resolve()
+        if candidate.is_file():
+            return candidate
+    # Keep unresolved path; import service will report FileNotFoundError
+    return path if path.is_absolute() else ((base_dir / path) if base_dir else path)
+
+
 async def collect_posts(source: PostSource) -> list[PostRecord]:
-    """Utility for tests: initialize → fetch all → close."""
     await source.initialize()
     try:
         posts: list[PostRecord] = []
@@ -145,22 +184,35 @@ async def collect_posts(source: PostSource) -> list[PostRecord]:
         await source.close()
 
 
+def load_posts_sync(source: PostSource) -> list[PostRecord]:
+    """Blocking helper for QThread / CLI (avoids nested asyncio.run issues)."""
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(collect_posts(source))
+
+    # Already inside an event loop (e.g. pytest-asyncio): run in a fresh loop/thread
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(collect_posts(source))).result()
+
+
 def filter_by_keywords(
     posts: Iterable[PostRecord],
     keywords: list[str],
     *,
     match_mode: str = "any",
     case_sensitive: bool = False,
+    normalize_whitespace: bool = True,
 ) -> list[PostRecord]:
-    """Simple keyword filter scaffold (full pipeline in Phase 2)."""
-    if not keywords:
-        return list(posts)
-    prepared = keywords if case_sensitive else [k.lower() for k in keywords]
-    out: list[PostRecord] = []
-    for post in posts:
-        text = post.text if case_sensitive else post.text.lower()
-        hits = [k in text for k in prepared]
-        ok = all(hits) if match_mode == "all" else any(hits)
-        if ok:
-            out.append(post)
-    return out
+    """Back-compat wrapper — prefer ``services.keyword_filter.filter_posts``."""
+    return _filter_posts(
+        posts,
+        keywords=keywords,
+        match_mode=match_mode,
+        case_sensitive=case_sensitive,
+        normalize_whitespace=normalize_whitespace,
+    )
