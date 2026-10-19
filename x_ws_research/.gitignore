@@ -24,11 +24,11 @@ htmlcov/
 *.swp
 *~
 
-# Runtime data (never commit)
-data/browser_profile/
-data/db/
-data/images/
-data/exports/
+# Runtime data (never commit contents; keep folder placeholders)
+data/browser_profile/*
+data/db/*
+data/images/*
+data/exports/*
 !data/browser_profile/.gitkeep
 !data/db/.gitkeep
 !data/images/.gitkeep
