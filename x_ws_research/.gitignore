@@ -29,10 +29,17 @@ data/browser_profile/*
 data/db/*
 data/images/*
 data/exports/*
+data/crops/*
 !data/browser_profile/.gitkeep
 !data/db/.gitkeep
 !data/images/.gitkeep
 !data/exports/.gitkeep
+!data/crops/.gitkeep
+
+# Packaging output
+packaging/dist/
+packaging/build/
+*.spec.bak
 
 # User data / secrets
 *.db

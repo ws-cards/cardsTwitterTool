@@ -1,7 +1,7 @@
 """Playwright Chromium lifecycle manager (visible browser, persistent profile).
 
-Phase 1: open / close / status / cleanup only.
 No X automation, no anti-detection, no credential logging.
+Profile always lives under user data — never bundled into releases.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ class BrowserManager:
     _context: Any = field(default=None, repr=False)
     _page: Any = field(default=None, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _disconnected: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.profile_dir is None:
@@ -49,7 +50,11 @@ class BrowserManager:
 
     @property
     def is_open(self) -> bool:
-        return self.status == BrowserStatus.READY and self._context is not None
+        return (
+            self.status == BrowserStatus.READY
+            and self._context is not None
+            and not self._disconnected
+        )
 
     @property
     def page(self) -> Any:
@@ -62,6 +67,7 @@ class BrowserManager:
                 return
             self.status = BrowserStatus.STARTING
             self.last_error = None
+            self._disconnected = False
             try:
                 from playwright.async_api import async_playwright
 
@@ -72,11 +78,14 @@ class BrowserManager:
                     viewport={"width": 1280, "height": 800},
                     args=["--disable-dev-shm-usage"],
                 )
+                # Unexpected user close → mark disconnected; next stop cleans up
+                self._context.on("close", self._on_context_close)
                 if self._context.pages:
                     self._page = self._context.pages[0]
                 else:
                     self._page = await self._context.new_page()
                 self.status = BrowserStatus.READY
+                # Never log cookies / tokens — path only
                 logger.info("Chromium started (profile=%s)", self.profile_dir)
             except Exception as exc:  # noqa: BLE001 — surface to UI, never crash host
                 self.last_error = str(exc)
@@ -85,43 +94,54 @@ class BrowserManager:
                 await self._force_cleanup()
                 raise
 
+    def _on_context_close(self, *_args: Any) -> None:
+        self._disconnected = True
+        if self.status == BrowserStatus.READY:
+            self.status = BrowserStatus.CLOSED
+        logger.info("Chromium context closed externally")
+
     async def stop(self) -> None:
-        """Close browser and release Playwright resources."""
+        """Close browser and release Playwright resources (idempotent)."""
         async with self._lock:
-            if self.status == BrowserStatus.CLOSED:
+            if self.status == BrowserStatus.CLOSED and self._playwright is None:
                 return
             self.status = BrowserStatus.CLOSING
             await self._force_cleanup()
             self.status = BrowserStatus.CLOSED
             self.last_error = None
+            self._disconnected = False
             logger.info("Chromium stopped")
 
     async def _force_cleanup(self) -> None:
         """Best-effort cleanup; swallow secondary errors."""
-        for name, closer in (
-            ("_context", self._safe_close_context),
-            ("_playwright", self._safe_stop_playwright),
-        ):
-            try:
-                await closer()
-            except Exception:  # noqa: BLE001
-                logger.exception("Cleanup error on %s", name)
-            finally:
-                setattr(self, name if name != "_playwright" else "_playwright", None)
-        self._page = None
-        self._context = None
-        self._playwright = None
+        try:
+            await self._safe_close_context()
+        except Exception:  # noqa: BLE001
+            logger.exception("Cleanup error on context")
+        finally:
+            self._context = None
+            self._page = None
+        try:
+            await self._safe_stop_playwright()
+        except Exception:  # noqa: BLE001
+            logger.exception("Cleanup error on playwright")
+        finally:
+            self._playwright = None
 
     async def _safe_close_context(self) -> None:
         if self._context is not None:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:  # noqa: BLE001
+                # Already closed by user — ignore
+                logger.debug("context.close raised (likely already closed)", exc_info=True)
 
     async def _safe_stop_playwright(self) -> None:
         if self._playwright is not None:
             await self._playwright.stop()
 
     async def navigate(self, url: str) -> None:
-        """Optional helper for smoke checks — not used for X scraping in Phase 1."""
+        """Smoke-check helper — not used for X scraping."""
         if not self.is_open or self._page is None:
             raise RuntimeError("Browser is not ready")
         await self._page.goto(url, wait_until="domcontentloaded")

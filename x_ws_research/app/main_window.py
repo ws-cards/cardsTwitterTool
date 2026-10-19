@@ -32,7 +32,7 @@ from storage.repository import DeckPreview, PostPreview, RecognitionPreview
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("X 貼文蒐集 × Weiss Schwarz 牌組工具 — Phase 3")
+        self.setWindowTitle("X 貼文蒐集 × Weiss Schwarz 牌組工具 — Phase 4")
         self.resize(1280, 800)
 
         self._dirs = ensure_data_dirs()
@@ -59,8 +59,8 @@ class MainWindow(QMainWindow):
         self._task_thread.start()
 
         self._apply_task_state(TaskState.IDLE)
-        self.monitor.append_log("Application started (Phase 3 recognition).", "INFO")
-        self.monitor.append_log(f"Data root: {self._dirs['root']}", "INFO")
+        self.monitor.append_log("Application started (Phase 4).", "INFO")
+        self.monitor.append_log(f"Data root (user-writable): {self._dirs['root']}", "INFO")
         self.monitor.append_log(
             "Vision engines are heuristic/replaceable — accuracy is not claimed.",
             "WARN",
@@ -377,13 +377,24 @@ class MainWindow(QMainWindow):
             self,
             "關於",
             "X 貼文蒐集與 Weiss Schwarz 牌組辨識工具\n"
-            "Phase 3：可替換辨識介面、啟發式 OCR／裁切、卡表、校正、CSV 匯出。\n"
-            "未假設 YOLO／權重已達標；不含 X 網頁自動化。",
+            "Phase 4：整合、測試、打包規格與使用手冊。\n"
+            "資料寫入使用者目錄；不含 X 網頁自動化；不打包登入／profile。",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        """Request task cancel + browser cleanup before threads quit."""
         self.monitor.append_log("Shutting down…", "INFO")
         from PySide6.QtCore import QEventLoop, QMetaObject, QTimer, Qt as QtCoreQt
+
+        # Cooperative cancel for any running import/recognition
+        try:
+            QMetaObject.invokeMethod(
+                self._task_thread.worker,
+                "request_stop",
+                QtCoreQt.ConnectionType.QueuedConnection,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
         loop = QEventLoop(self)
         self._browser_thread.worker.stopped_ok.connect(loop.quit)
@@ -394,11 +405,13 @@ class MainWindow(QMainWindow):
             QtCoreQt.ConnectionType.QueuedConnection,
         )
         QTimer.singleShot(8000, loop.quit)
-        if self._browser_status in {"READY", "STARTING"}:
-            loop.exec()
+        # Always wait briefly so cleanup runs even if status was already CLOSED
+        loop.exec()
 
         self._browser_thread.quit()
         self._task_thread.quit()
-        self._browser_thread.wait(3000)
-        self._task_thread.wait(3000)
+        if not self._browser_thread.wait(5000):
+            self.monitor.append_log("Browser thread did not exit cleanly.", "WARN")
+        if not self._task_thread.wait(5000):
+            self.monitor.append_log("Task thread did not exit cleanly.", "WARN")
         event.accept()

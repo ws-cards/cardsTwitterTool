@@ -6,7 +6,13 @@ from services.image_store import StoredImage, sha256_file, store_local_image
 from services.import_service import ImportRequest, run_import
 from services.keyword_filter import filter_posts, keyword_matches, parse_keyword_list
 from services.log_buffer import LogBuffer
-from services.paths import ensure_data_dirs, get_browser_profile_dir, get_data_root
+from services.paths import (
+    ensure_data_dirs,
+    get_browser_profile_dir,
+    get_crops_dir,
+    get_data_root,
+    is_frozen,
+)
 from services.recognition_service import (
     RecognitionRequest,
     RecognitionStats,
@@ -26,7 +32,9 @@ __all__ = [
     "export_decks_csv",
     "filter_posts",
     "get_browser_profile_dir",
+    "get_crops_dir",
     "get_data_root",
+    "is_frozen",
     "import_card_catalog",
     "keyword_matches",
     "load_catalog_map",

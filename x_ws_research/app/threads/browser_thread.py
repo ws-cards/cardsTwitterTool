@@ -37,6 +37,7 @@ class BrowserWorker(QObject):
 
     @Slot()
     def cleanup(self) -> None:
+        """Exit-path cleanup — always emits stopped_ok so UI can finish quitting."""
         self._run_coro(self._close(silent=True))
 
     def _run_coro(self, coro) -> None:
@@ -48,6 +49,7 @@ class BrowserWorker(QObject):
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
             self.log_message.emit(f"Browser error: {exc}", "ERROR")
+            self.status_changed.emit("ERROR")
 
     async def _ensure_manager(self):
         if self._manager is None:
@@ -67,21 +69,23 @@ class BrowserWorker(QObject):
         await manager.start()
         self.status_changed.emit(manager.status.value)
         self.started_ok.emit()
-        self.log_message.emit("Chromium ready (persistent profile).", "INFO")
+        self.log_message.emit("Chromium ready (persistent profile under user data).", "INFO")
 
     async def _close(self, silent: bool = False) -> None:
-        if self._manager is None:
-            self.status_changed.emit("CLOSED")
+        try:
+            if self._manager is None:
+                self.status_changed.emit("CLOSED")
+                return
+            self.status_changed.emit("CLOSING")
+            if not silent:
+                self.log_message.emit("Closing Chromium…", "INFO")
+            await self._manager.stop()
+            self.status_changed.emit(self._manager.status.value)
+            if not silent:
+                self.log_message.emit("Chromium closed.", "INFO")
+        finally:
+            # Always unblock quit waiters (once)
             self.stopped_ok.emit()
-            return
-        self.status_changed.emit("CLOSING")
-        if not silent:
-            self.log_message.emit("Closing Chromium…", "INFO")
-        await self._manager.stop()
-        self.status_changed.emit(self._manager.status.value)
-        self.stopped_ok.emit()
-        if not silent:
-            self.log_message.emit("Chromium closed.", "INFO")
 
 
 class BrowserThread(QThread):
