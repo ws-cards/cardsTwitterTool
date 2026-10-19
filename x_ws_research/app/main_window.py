@@ -1,4 +1,4 @@
-"""Main application window — Phase 2 import + preview."""
+"""Main application window — Phase 3 recognition + correction."""
 
 from __future__ import annotations
 
@@ -24,15 +24,16 @@ from schemas.task_state import TaskState
 from services.import_service import ImportRequest
 from services.log_buffer import LogBuffer
 from services.paths import ensure_data_dirs, get_browser_profile_dir, get_data_root
+from services.recognition_service import RecognitionRequest
 from storage.database import Database
-from storage.repository import PostPreview
+from storage.repository import DeckPreview, PostPreview, RecognitionPreview
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("X 貼文蒐集 × Weiss Schwarz 牌組工具 — Phase 2")
-        self.resize(1200, 760)
+        self.setWindowTitle("X 貼文蒐集 × Weiss Schwarz 牌組工具 — Phase 3")
+        self.resize(1280, 800)
 
         self._dirs = ensure_data_dirs()
         self._db_path = get_data_root() / "db" / "app.sqlite"
@@ -58,9 +59,12 @@ class MainWindow(QMainWindow):
         self._task_thread.start()
 
         self._apply_task_state(TaskState.IDLE)
-        self.monitor.append_log("Application started (Phase 2 import).", "INFO")
+        self.monitor.append_log("Application started (Phase 3 recognition).", "INFO")
         self.monitor.append_log(f"Data root: {self._dirs['root']}", "INFO")
-        self.monitor.append_log(f"Database: {self._db_path}", "INFO")
+        self.monitor.append_log(
+            "Vision engines are heuristic/replaceable — accuracy is not claimed.",
+            "WARN",
+        )
         self._request_refresh()
 
     def _build_toolbar(self) -> None:
@@ -70,27 +74,42 @@ class MainWindow(QMainWindow):
 
         self.act_open_browser = QAction("開啟瀏覽器", self)
         self.act_close_browser = QAction("關閉瀏覽器", self)
-        self.act_start = QAction("開始任務", self)
+        self.act_start = QAction("匯入貼文", self)
         self.act_stop = QAction("停止任務", self)
+        self.act_recognize = QAction("執行辨識", self)
+        self.act_catalog = QAction("匯入卡表", self)
+        self.act_export = QAction("匯出 CSV", self)
         self.act_import = QAction("匯入…", self)
         self.act_about = QAction("關於", self)
 
         self.act_close_browser.setEnabled(False)
         self.act_stop.setEnabled(False)
 
-        tb.addAction(self.act_open_browser)
-        tb.addAction(self.act_close_browser)
+        for act in (
+            self.act_open_browser,
+            self.act_close_browser,
+        ):
+            tb.addAction(act)
         tb.addSeparator()
-        tb.addAction(self.act_start)
-        tb.addAction(self.act_stop)
+        for act in (
+            self.act_start,
+            self.act_stop,
+            self.act_recognize,
+            self.act_catalog,
+            self.act_export,
+            self.act_import,
+        ):
+            tb.addAction(act)
         tb.addSeparator()
-        tb.addAction(self.act_import)
         tb.addAction(self.act_about)
 
         self.act_open_browser.triggered.connect(self._on_open_browser)
         self.act_close_browser.triggered.connect(self._on_close_browser)
         self.act_start.triggered.connect(self._on_start_task)
         self.act_stop.triggered.connect(self._on_stop_task)
+        self.act_recognize.triggered.connect(self._on_recognize)
+        self.act_catalog.triggered.connect(self._on_catalog_import)
+        self.act_export.triggered.connect(self._on_export)
         self.act_import.triggered.connect(self._on_import)
         self.act_about.triggered.connect(self._on_about)
 
@@ -102,16 +121,20 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.monitor)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([380, 820])
+        splitter.setSizes([400, 880])
         self.setCentralWidget(splitter)
 
         self.left.start_requested.connect(self._on_start_task)
         self.left.stop_requested.connect(self._on_stop_task)
         self.left.refresh_requested.connect(self._on_refresh)
         self.left.import_requested.connect(lambda _: self._on_import())
+        self.left.catalog_import_requested.connect(self._on_catalog_import)
+        self.left.recognize_requested.connect(self._on_recognize)
+        self.left.export_requested.connect(self._on_export)
         self.monitor.open_browser_requested.connect(self._on_open_browser)
         self.monitor.close_browser_requested.connect(self._on_close_browser)
         self.monitor.open_output_requested.connect(self._on_open_output)
+        self.monitor.correction_requested.connect(self._on_correction)
 
     def _wire_threads(self) -> None:
         bw = self._browser_thread.worker
@@ -131,6 +154,8 @@ class MainWindow(QMainWindow):
         tw.progress.connect(self._on_task_progress)
         tw.counts_changed.connect(self._on_counts)
         tw.preview_ready.connect(self._on_preview_ready)
+        tw.decks_ready.connect(self._on_decks_ready)
+        tw.recognitions_ready.connect(self._on_recognitions_ready)
         tw.finished_ok.connect(lambda: self._status.set_hint("任務完成"))
         tw.failed.connect(self._on_task_failed)
 
@@ -194,14 +219,12 @@ class MainWindow(QMainWindow):
         self.act_open_browser.setEnabled(status in {"CLOSED", "ERROR"})
         self.act_close_browser.setEnabled(status in {"READY", "ERROR"})
 
-    # --- Task / import ---
+    # --- Tasks ---
 
     @Slot()
     def _on_start_task(self) -> None:
-        """Phase 2: Start opens the import dialog (primary data path)."""
         if not self._task_state.can_start:
             return
-        # Avoid nested modal when already choosing a file via 匯入…
         self._on_import()
 
     @Slot()
@@ -229,6 +252,9 @@ class MainWindow(QMainWindow):
         self.act_start.setEnabled(state.can_start)
         self.act_stop.setEnabled(state.can_stop)
         self.act_import.setEnabled(state.can_start)
+        self.act_recognize.setEnabled(state.can_start)
+        self.act_catalog.setEnabled(state.can_start)
+        self.act_export.setEnabled(state.can_start)
 
     @Slot(int, int)
     def _on_task_progress(self, current: int, total: int) -> None:
@@ -244,9 +270,25 @@ class MainWindow(QMainWindow):
             typed = [p for p in previews if isinstance(p, PostPreview)]
             self.monitor.show_post_previews(typed)
 
+    @Slot(object)
+    def _on_decks_ready(self, decks: object) -> None:
+        if isinstance(decks, list):
+            typed = [d for d in decks if isinstance(d, DeckPreview)]
+            self.monitor.show_decks(typed)
+
+    @Slot(object)
+    def _on_recognitions_ready(self, items: object) -> None:
+        if isinstance(items, list):
+            typed = [r for r in items if isinstance(r, RecognitionPreview)]
+            self.monitor.show_recognitions(typed)
+
     @Slot(str)
     def _on_task_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "任務失敗", message)
+        # Show warning but never crash
+        try:
+            QMessageBox.warning(self, "任務失敗", message)
+        except Exception:  # noqa: BLE001
+            self.monitor.append_log(f"UI warn failed: {message}", "ERROR")
 
     @Slot()
     def _on_import(self) -> None:
@@ -260,7 +302,6 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-
         request = ImportRequest(
             path=Path(path),
             keywords=self.left.keyword_config(),
@@ -272,6 +313,56 @@ class MainWindow(QMainWindow):
         self.monitor.append_log(f"Queued import: {path}", "INFO")
         self._status.set_hint("匯入中…")
         self._invoke_worker("run_import_task")
+
+    @Slot()
+    def _on_catalog_import(self) -> None:
+        if not self._task_state.can_start:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "匯入卡表（JSON / CSV）",
+            str(Path.cwd()),
+            "Catalog (*.json *.csv)",
+        )
+        if not path:
+            return
+        self._task_thread.worker.set_catalog_path(Path(path))
+        self.monitor.append_log(f"Queued catalog import: {path}", "INFO")
+        self._invoke_worker("run_catalog_import")
+
+    @Slot()
+    def _on_recognize(self) -> None:
+        if not self._task_state.can_start:
+            return
+        self._task_thread.worker.set_recognition_request(
+            RecognitionRequest(db_path=self._db_path)
+        )
+        self.monitor.append_log("Queued recognition task…", "INFO")
+        self._status.set_hint("辨識中…")
+        self._invoke_worker("run_recognition_task")
+
+    @Slot()
+    def _on_export(self) -> None:
+        if not self._task_state.can_start:
+            return
+        default = self._dirs["exports"] / "decks.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "匯出牌組 CSV",
+            str(default),
+            "CSV (*.csv)",
+        )
+        if not path:
+            return
+        self._task_thread.worker.set_export_path(Path(path))
+        self._invoke_worker("run_export_task")
+
+    @Slot(object)
+    def _on_correction(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        self._task_thread.worker.set_correction(payload)
+        self._invoke_worker("run_correction_task")
 
     @Slot()
     def _on_open_output(self) -> None:
@@ -286,8 +377,8 @@ class MainWindow(QMainWindow):
             self,
             "關於",
             "X 貼文蒐集與 Weiss Schwarz 牌組辨識工具\n"
-            "Phase 2：JSON/CSV 匯入、關鍵字篩選、SQLite、去重、預覽。\n"
-            "不含 X 網頁自動化擷取。",
+            "Phase 3：可替換辨識介面、啟發式 OCR／裁切、卡表、校正、CSV 匯出。\n"
+            "未假設 YOLO／權重已達標；不含 X 網頁自動化。",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:

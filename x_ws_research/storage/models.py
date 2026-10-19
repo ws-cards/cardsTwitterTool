@@ -112,16 +112,39 @@ class DeckRow(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(256), default="")
     post_id: Mapped[int | None] = mapped_column(ForeignKey("posts.id"), nullable=True)
+    post_image_id: Mapped[int | None] = mapped_column(
+        ForeignKey("post_images.id"), nullable=True, index=True
+    )
+    source_key: Mapped[str] = mapped_column(String(256), default="", index=True)
+    status: Mapped[str] = mapped_column(String(32), default="draft")  # draft|confirmed
     note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    cards: Mapped[list[DeckCardRow]] = relationship(
+        "DeckCardRow",
+        back_populates="deck",
+        cascade="all, delete-orphan",
+    )
 
 
 class DeckCardRow(Base):
     __tablename__ = "deck_cards"
+    __table_args__ = (
+        UniqueConstraint("deck_id", "card_number", name="uq_deck_cards_deck_number"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    deck_id: Mapped[int] = mapped_column(ForeignKey("decks.id", ondelete="CASCADE"))
-    card_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deck_id: Mapped[int] = mapped_column(ForeignKey("decks.id", ondelete="CASCADE"), index=True)
+    card_number: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    card_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     quantity: Mapped[int] = mapped_column(Integer, default=1)
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    correction_log: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    deck: Mapped[DeckRow] = relationship("DeckRow", back_populates="cards")
 
 
 class CardCatalogRow(Base):
@@ -138,9 +161,18 @@ class RecognitionResultRow(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     post_image_id: Mapped[int | None] = mapped_column(
-        ForeignKey("post_images.id"), nullable=True
+        ForeignKey("post_images.id"), nullable=True, index=True
     )
+    deck_id: Mapped[int | None] = mapped_column(ForeignKey("decks.id"), nullable=True)
+    crop_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    # pending | matched | empty | failed | corrected
     card_number: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    card_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     confidence: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
