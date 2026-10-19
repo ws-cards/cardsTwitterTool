@@ -1,4 +1,4 @@
-"""Left settings panel — UI skeleton (stubs for Phase 2 business logic)."""
+"""Left settings panel — keywords & import controls for Phase 2."""
 
 from __future__ import annotations
 
@@ -18,14 +18,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from schemas.models import KeywordConfig
+from services.keyword_filter import parse_keyword_list
+
 
 class LeftSettingsPanel(QWidget):
-    """Account / keyword / filter / task / settings management scaffold."""
+    """Account / keyword / filter / task / settings management."""
 
     start_requested = Signal()
     stop_requested = Signal()
     refresh_requested = Signal()
-    import_requested = Signal(str)  # path hint / stub
+    import_requested = Signal(str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -34,7 +37,6 @@ class LeftSettingsPanel(QWidget):
     def _build(self) -> None:
         root = QVBoxLayout(self)
 
-        # --- Accounts ---
         accounts = QGroupBox("帳號管理")
         acc_layout = QVBoxLayout(accounts)
         self.account_list = QListWidget()
@@ -44,7 +46,7 @@ class LeftSettingsPanel(QWidget):
         self.btn_edit_account = QPushButton("編輯")
         self.btn_remove_account = QPushButton("移除")
         for b in (self.btn_add_account, self.btn_edit_account, self.btn_remove_account):
-            b.setEnabled(False)  # Phase 2
+            b.setEnabled(False)
             acc_btns.addWidget(b)
         self.chk_account_enabled = QCheckBox("啟用選取帳號")
         self.chk_account_enabled.setChecked(True)
@@ -53,13 +55,13 @@ class LeftSettingsPanel(QWidget):
         acc_layout.addWidget(self.chk_account_enabled)
         root.addWidget(accounts)
 
-        # --- Keywords ---
         keywords = QGroupBox("關鍵字設定")
         kw_form = QFormLayout(keywords)
         self.keyword_edit = QLineEdit()
-        self.keyword_edit.setPlaceholderText("以逗號分隔；Phase 2 完整解析")
+        self.keyword_edit.setPlaceholderText("逗號分隔，例如：Weiss, デッキ")
         self.match_mode = QComboBox()
-        self.match_mode.addItems(["任一符合 (any)", "全部符合 (all)"])
+        self.match_mode.addItem("任一符合 (OR / any)", "any")
+        self.match_mode.addItem("全部符合 (AND / all)", "all")
         self.chk_case = QCheckBox("區分大小寫")
         self.chk_normalize_ws = QCheckBox("正規化空白")
         self.chk_normalize_ws.setChecked(True)
@@ -69,7 +71,6 @@ class LeftSettingsPanel(QWidget):
         kw_form.addRow(self.chk_normalize_ws)
         root.addWidget(keywords)
 
-        # --- Filters ---
         filters = QGroupBox("貼文篩選")
         f_form = QFormLayout(filters)
         self.date_from = QLineEdit()
@@ -89,16 +90,16 @@ class LeftSettingsPanel(QWidget):
         f_form.addRow("辨識狀態", self.filter_recognition)
         root.addWidget(filters)
 
-        # --- Task ---
         task = QGroupBox("任務設定")
         t_form = QFormLayout(task)
         self.max_posts = QSpinBox()
         self.max_posts.setRange(1, 10_000)
-        self.max_posts.setValue(50)
-        self.chk_download_images = QCheckBox("下載圖片")
-        self.chk_download_images.setChecked(True)
+        self.max_posts.setValue(500)
+        self.chk_download_images = QCheckBox("下載遠端圖片")
+        self.chk_download_images.setChecked(False)
+        self.chk_download_images.setEnabled(False)  # Phase 2: local images only
         self.chk_recognition = QCheckBox("執行牌組辨識")
-        self.chk_recognition.setEnabled(False)  # Phase 3
+        self.chk_recognition.setEnabled(False)
         self.output_dir = QLineEdit("data/exports")
         t_form.addRow("最大筆數", self.max_posts)
         t_form.addRow(self.chk_download_images)
@@ -119,26 +120,32 @@ class LeftSettingsPanel(QWidget):
         t_form.addRow(task_btns)
         root.addWidget(task)
 
-        # --- Settings ---
         settings = QGroupBox("設定管理")
         s_layout = QHBoxLayout(settings)
         self.btn_save_settings = QPushButton("儲存")
         self.btn_load_settings = QPushButton("載入")
         self.btn_reset_settings = QPushButton("恢復預設")
         self.btn_import = QPushButton("匯入 JSON/CSV…")
-        for b in (
-            self.btn_save_settings,
-            self.btn_load_settings,
-            self.btn_reset_settings,
-        ):
-            b.setEnabled(False)  # Phase 2
+        for b in (self.btn_save_settings, self.btn_load_settings, self.btn_reset_settings):
+            b.setEnabled(False)
             s_layout.addWidget(b)
         self.btn_import.clicked.connect(lambda: self.import_requested.emit(""))
         s_layout.addWidget(self.btn_import)
         root.addWidget(settings)
 
-        root.addWidget(QLabel("Phase 1：左側為 UI 骨架，業務邏輯於後續階段補齊。"))
+        root.addWidget(QLabel("Phase 2：JSON/CSV 匯入、關鍵字篩選、SQLite、去重與預覽。"))
         root.addStretch(1)
+
+    def keyword_config(self) -> KeywordConfig:
+        mode = self.match_mode.currentData()
+        if mode not in {"any", "all"}:
+            mode = "any"
+        return KeywordConfig(
+            keywords=parse_keyword_list(self.keyword_edit.text()),
+            match_mode=mode,
+            case_sensitive=self.chk_case.isChecked(),
+            normalize_whitespace=self.chk_normalize_ws.isChecked(),
+        )
 
     def apply_task_state(self, state_name: str) -> None:
         from schemas.task_state import TaskState
@@ -147,3 +154,4 @@ class LeftSettingsPanel(QWidget):
         self.btn_start.setEnabled(state.can_start)
         self.btn_stop.setEnabled(state.can_stop)
         self.btn_refresh.setEnabled(not state.is_busy)
+        self.btn_import.setEnabled(state.can_start)

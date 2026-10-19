@@ -50,7 +50,13 @@ def test_log_append_has_cap(window):
 
 
 def test_demo_task_completes(qtbot, window):
+    from PySide6.QtCore import QMetaObject, Qt as QtCoreQt
+
     with qtbot.waitSignal(window._task_thread.worker.finished_ok, timeout=5000):
-        window._on_start_task()
+        QMetaObject.invokeMethod(
+            window._task_thread.worker,
+            "run_demo_task",
+            QtCoreQt.ConnectionType.QueuedConnection,
+        )
     assert window._task_state == TaskState.COMPLETED
     assert window.left.btn_start.isEnabled()
